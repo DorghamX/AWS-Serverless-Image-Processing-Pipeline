@@ -1,0 +1,23 @@
+# SAM build artifacts
+.aws-sam/
+samconfig.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Layer build output
+layers/*/python/
+layers/*.zip
+
+# Local AI/agent tooling config (not part of the project)
+.agents/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

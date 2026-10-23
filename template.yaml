@@ -1,0 +1,552 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless Image Processing Pipeline — S3 -> SQS -> Step Functions -> Lambda
+  (validate / resize / watermark) -> destination S3, with DynamoDB metadata,
+  CloudFront delivery, API Gateway pre-signed upload URLs and SNS notifications.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Email address subscribed to the SNS topic for job success/failure notifications. Leave empty to skip.
+  WatermarkText:
+    Type: String
+    Default: "© ImagePipeline"
+    Description: Text burned into processed images as a watermark.
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: CloudFront edge locations class (100 = North America + Europe only, cheapest).
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 512
+    Timeout: 30
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ImageMetadataTable
+        TOPIC_ARN: !Ref NotificationTopic
+        WATERMARK_TEXT: !Ref WatermarkText
+
+Resources:
+
+  # ---------------------------------------------------------------- Amazon S3
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    DependsOn: ImageQueuePolicy
+    Properties:
+      BucketName: !Sub 'image-pipeline-source-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: transition-uploads-to-ia
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: expire-uploads-after-90-days
+            Status: Enabled
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt ImageQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub 'image-pipeline-dest-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------------------------------------------------------- Amazon SQS
+  ImageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'image-pipeline-queue-${AWS::Region}'
+      MessageRetentionPeriod: 345600        # 4 days
+      VisibilityTimeout: 300                # >= Lambda timeout * concurrency headroom
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  ImageProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'image-pipeline-dlq-${AWS::Region}'
+      MessageRetentionPeriod: 1209600       # 14 days — keep failures inspectable
+
+  ImageQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ImageQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToSendMessages
+            Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt ImageQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt SourceBucket.Arn
+
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: image-pipeline-dlq-not-empty
+      AlarmDescription: Alerts when messages land in the dead-letter queue (permanent processing failures).
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ImageProcessingDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ---------------------------------------------------------------- Amazon DynamoDB
+  ImageMetadataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub 'image-metadata-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: imageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: imageId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---------------------------------------------------------------- Amazon SNS
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'image-pipeline-notifications-${AWS::StackName}'
+
+  NotificationEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ---------------------------------------------------------------- Lambda layer
+  PillowLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: pillow
+      Description: Pillow image processing library for python3.12 (arm64)
+      ContentUri: layers/pillow/
+      CompatibleRuntimes: [python3.12]
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: makefile
+
+  # ---------------------------------------------------------------- Lambda functions
+  PresignApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'image-pipeline-presign-${AWS::StackName}'
+      CodeUri: src/pipeline/
+      Handler: presign.lambda_handler
+      Description: API Gateway endpoint that returns S3 pre-signed upload URLs
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:PutObject]
+              Resource: !Sub '${SourceBucket.Arn}/uploads/*'
+            - Effect: Allow
+              Action: [dynamodb:PutItem]
+              Resource: !GetAtt ImageMetadataTable.Arn
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+      Events:
+        PresignApi:
+          Type: HttpApi
+          Properties:
+            Path: /images/presign
+            Method: POST
+            ApiId: !Ref HttpApi
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: v1
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowHeaders: [content-type]
+        AllowMethods: [POST, OPTIONS]
+
+  DispatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'image-pipeline-dispatcher-${AWS::StackName}'
+      CodeUri: src/pipeline/
+      Handler: dispatcher.lambda_handler
+      Description: Consumes SQS messages and starts a Step Functions execution per image
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:ChangeMessageVisibility
+              Resource: !GetAtt ImageQueue.Arn
+            - Effect: Allow
+              Action: [states:StartExecution]
+              Resource: !Ref ImagePipelineStateMachine
+            - Effect: Allow
+              Action: [dynamodb:UpdateItem]
+              Resource: !GetAtt ImageMetadataTable.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ImagePipelineStateMachine
+      Events:
+        SqsEvent:
+          Type: Sqs
+          Properties:
+            Queue: !GetAtt ImageQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+
+  ValidateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'image-pipeline-validate-${AWS::StackName}'
+      CodeUri: src/pipeline/
+      Handler: validate.lambda_handler
+      Layers: [!Ref PillowLayer]
+      Description: Validates the uploaded image (format, dimensions, readability)
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:GetObject]
+              Resource: !Sub '${SourceBucket.Arn}/*'
+            - Effect: Allow
+              Action: [dynamodb:UpdateItem]
+              Resource: !GetAtt ImageMetadataTable.Arn
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+
+  ThumbnailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'image-pipeline-thumbnail-${AWS::StackName}'
+      CodeUri: src/pipeline/
+      Handler: resize.lambda_handler_thumbnail
+      Layers: [!Ref PillowLayer]
+      Description: Creates a 256x256 square thumbnail
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:GetObject]
+              Resource: !Sub '${SourceBucket.Arn}/*'
+            - Effect: Allow
+              Action: [s3:PutObject]
+              Resource: !Sub '${DestinationBucket.Arn}/*'
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          DESTINATION_BUCKET: !Ref DestinationBucket
+
+  FullResFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'image-pipeline-fullres-${AWS::StackName}'
+      CodeUri: src/pipeline/
+      Handler: resize.lambda_handler_fullres
+      Layers: [!Ref PillowLayer]
+      Description: Creates a watermarked-later full-resolution variant (max 1920px)
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:GetObject]
+              Resource: !Sub '${SourceBucket.Arn}/*'
+            - Effect: Allow
+              Action: [s3:PutObject]
+              Resource: !Sub '${DestinationBucket.Arn}/*'
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          DESTINATION_BUCKET: !Ref DestinationBucket
+
+  WatermarkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'image-pipeline-watermark-${AWS::StackName}'
+      CodeUri: src/pipeline/
+      Handler: watermark.lambda_handler
+      Layers: [!Ref PillowLayer]
+      Description: Burns WATERMARK_TEXT into every generated variant
+      MemorySize: 1024
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub '${DestinationBucket.Arn}/*'
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref DestinationBucket
+
+  MetadataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'image-pipeline-metadata-${AWS::StackName}'
+      CodeUri: src/pipeline/
+      Handler: metadata.lambda_handler
+      Description: Writes final metadata (status, dimensions, variants) to DynamoDB
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:UpdateItem]
+              Resource: !GetAtt ImageMetadataTable.Arn
+
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'image-pipeline-notify-${AWS::StackName}'
+      CodeUri: src/pipeline/
+      Handler: notify.lambda_handler
+      Description: Publishes a COMPLETED message to the SNS topic
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [sns:Publish]
+              Resource: !Ref NotificationTopic
+
+  FailureFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'image-pipeline-failure-${AWS::StackName}'
+      CodeUri: src/pipeline/
+      Handler: failure.lambda_handler
+      Timeout: 15
+      Description: Catch-all — marks the job FAILED in DynamoDB and publishes to SNS
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:UpdateItem]
+              Resource: !GetAtt ImageMetadataTable.Arn
+            - Effect: Allow
+              Action: [sns:Publish]
+              Resource: !Ref NotificationTopic
+
+  # ---------------------------------------------------------------- Step Functions
+  ImagePipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub 'image-pipeline-${AWS::StackName}'
+      Type: STANDARD
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [lambda:InvokeFunction]
+              Resource:
+                - !GetAtt ValidateFunction.Arn
+                - !GetAtt ThumbnailFunction.Arn
+                - !GetAtt FullResFunction.Arn
+                - !GetAtt WatermarkFunction.Arn
+                - !GetAtt MetadataFunction.Arn
+                - !GetAtt NotifyFunction.Arn
+                - !GetAtt FailureFunction.Arn
+      Definition:
+        StartAt: ValidateImage
+        States:
+          ValidateImage:
+            Type: Task
+            Resource: !GetAtt ValidateFunction.Arn
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 5
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: FailJob
+            ResultPath: $.validation
+            Next: GenerateVariants
+
+          GenerateVariants:
+            Type: Parallel
+            ResultPath: $.variants
+            Branches:
+              - StartAt: ResizeThumbnail
+                States:
+                  ResizeThumbnail:
+                    Type: Task
+                    Resource: !GetAtt ThumbnailFunction.Arn
+                    Retry:
+                      - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException]
+                        IntervalSeconds: 5
+                        MaxAttempts: 2
+                        BackoffRate: 2
+                    End: true
+              - StartAt: ResizeFullRes
+                States:
+                  ResizeFullRes:
+                    Type: Task
+                    Resource: !GetAtt FullResFunction.Arn
+                    Retry:
+                      - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException]
+                        IntervalSeconds: 5
+                        MaxAttempts: 2
+                        BackoffRate: 2
+                    End: true
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: FailJob
+            Next: ApplyWatermark
+
+          ApplyWatermark:
+            Type: Task
+            Resource: !GetAtt WatermarkFunction.Arn
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 5
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: FailJob
+            ResultPath: $.watermark
+            Next: StoreMetadata
+
+          StoreMetadata:
+            Type: Task
+            Resource: !GetAtt MetadataFunction.Arn
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 5
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: FailJob
+            Next: NotifySuccess
+
+          NotifySuccess:
+            Type: Task
+            Resource: !GetAtt NotifyFunction.Arn
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: FailJob
+            Next: PipelineComplete
+
+          PipelineComplete:
+            Type: Succeed
+
+          FailJob:
+            Type: Task
+            Resource: !GetAtt FailureFunction.Arn
+            End: true
+
+  # ---------------------------------------------------------------- CloudFront
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'image-pipeline-oac-${AWS::StackName}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: OriginAccessControl
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Serves processed images from the destination bucket
+        PriceClass: !Ref PriceClass
+        Origins:
+          - Id: DestinationBucketOrigin
+            DomainName: !GetAtt DestinationBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: DestinationBucketOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-724881172084   # AWS managed policy: CachingOptimized
+          Compress: true
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  DestinationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: CloudFrontDistribution
+    Properties:
+      Bucket: !Ref DestinationBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${DestinationBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution.Id}'
+
+Outputs:
+  SourceBucketName:
+    Value: !Ref SourceBucket
+  DestinationBucketName:
+    Value: !Ref DestinationBucket
+  QueueUrl:
+    Value: !Ref ImageQueue
+  DeadLetterQueueUrl:
+    Value: !Ref ImageProcessingDLQ
+  DynamoDBTableName:
+    Value: !Ref ImageMetadataTable
+  NotificationTopicArn:
+    Value: !Ref NotificationTopic
+  StateMachineArn:
+    Value: !Ref ImagePipelineStateMachine
+  PresignApiUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1/images/presign'
+  CloudFrontDomain:
+    Value: !GetAtt CloudFrontDistribution.DomainName

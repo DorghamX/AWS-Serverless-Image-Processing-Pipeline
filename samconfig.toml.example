@@ -1,0 +1,15 @@
+version = 0.1
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+stack_name = "image-pipeline"
+resolve_s3 = true
+s3_prefix = "image-pipeline"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+# Uncomment and adjust to subscribe an email to job notifications:
+# parameter_overrides = "NotificationEmail=you@example.com WatermarkText=© MyProject"
